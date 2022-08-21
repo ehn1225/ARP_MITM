@@ -12,7 +12,7 @@
 #include <vector>
 #include <pthread.h>
 #include <signal.h>
-
+#define MAX_PACKET_SIZE 10000
 using namespace std;
 
 #pragma pack(push, 1)
@@ -125,7 +125,7 @@ Mac getMacFromIp(Host* me, Ip* sender){
 			if (res == 0) continue;
 			if (res == PCAP_ERROR || res == PCAP_ERROR_BREAK) {
 				fprintf(stderr, "[getMacFromIp] pcap_next_ex return %d error=%s\n", res, pcap_geterr(handle));
-					exit(1);
+				exit(1);
 			}
 			struct EthArpPacket *eth_arp_packet = (struct EthArpPacket *)tmp_packet;
 			if(eth_arp_packet->eth_.type() != EthHdr::Arp)
@@ -144,9 +144,8 @@ Host getMyNetworkInfo(char* dev){
 	ifstream iface("/sys/class/net/" + string(dev) + "/address");
 	tmp.mac = Mac(string((istreambuf_iterator<char>(iface)), istreambuf_iterator<char>()));
 	
-	int fd;
 	struct ifreq ifr;
-	fd = socket(AF_INET, SOCK_DGRAM, 0);
+	int fd = socket(AF_INET, SOCK_DGRAM, 0);
 	ifr.ifr_addr.sa_family = AF_INET;
 	memcpy(ifr.ifr_name, dev, IFNAMSIZ - 1);
 	ioctl(fd, SIOCGIFADDR, &ifr);
@@ -190,9 +189,8 @@ void sig_handler(int sig){
 }
 
 void RelayJumboFrame(const u_char* packet, EthArpPacket *eth_hdr){
-	//점보프레임 수정중인 부분
-	u_char data[65535];
-	memcpy(data, eth_hdr, 65535);
+	u_char data[MAX_PACKET_SIZE];
+	memcpy(data, eth_hdr, MAX_PACKET_SIZE);
 
 	u_char relayData[1515];
 
@@ -201,31 +199,28 @@ void RelayJumboFrame(const u_char* packet, EthArpPacket *eth_hdr){
 	struct tcp *tcp_hdr = (struct tcp*)(packet + 14 + size_ip);
 	u_int size_tcp = TH_OFF(tcp_hdr)*4; 
 	u_int payload_size = ntohs(ip_hdr->ip_len) - size_ip - size_tcp;
-	printf("payload size =  %d\n", payload_size);
-	struct Iphdr modify_iphdr;
+	//printf("payload size =  %d\n", payload_size);
 	//Ethernet 부분은 공통임.
-	memcpy(relayData, eth_hdr, 14);
-	memcpy(&modify_iphdr, ip_hdr, 20);
+	memcpy(relayData, eth_hdr, 34);
 
-	int packet_size = 0;
 	int packet_offset = 0;		//TCP헤더의 위치부터 시작함.
 	int left_payload_size = payload_size;
 	uint16_t fragment_Offset = 0;
-	//IP 해더 조작부
 
 	while(left_payload_size > 0){
 		//IP헤더 offset 수정
 		//DATA 복사
 		int read_size = ((left_payload_size >= 1480) ? (1480) : left_payload_size);
-		modify_iphdr.ip_len = htons(read_size + 20);
+		u_short ip_len = htons(read_size + 20);
 		uint16_t MFflags = (left_payload_size > 1480 ? 1 : 0);
 		MFflags = (MFflags << 13);
-		modify_iphdr.flags = htons(MFflags | fragment_Offset);
-		cout << "ip len : " << modify_iphdr.ip_len << " Offset " << packet_offset << " read size " << read_size <<  endl;
+		uint16_t flags = htons(MFflags | fragment_Offset);
+		//cout << "ip len : " << ntohs(ip_len) << " Offset " << fragment_Offset << " read size " << read_size <<  endl;
 		
-		memcpy(relayData + 14, &modify_iphdr, 20); //hton 필요할 듯.
-
-		cout << "copy eth* from : " << 349 + packet_offset << ",  " << read_size << "byte" <<  endl;
+		//memcpy(relayData + 14, &modify_iphdr, 20); //hton 필요할 듯.
+		memcpy(relayData + 16, &ip_len, 2);
+		memcpy(relayData + 20, &flags, 2);
+		//cout << "copy eth* from : " << 34 + packet_offset << ",  " << read_size << "byte" <<  endl;
 		memcpy(relayData + 34, data + 34 + packet_offset, read_size);
 		fragment_Offset += (read_size / 8);
 		left_payload_size -= read_size;
@@ -235,20 +230,19 @@ void RelayJumboFrame(const u_char* packet, EthArpPacket *eth_hdr){
 		if (res != 0) {
 			fprintf(stderr, "[main_Relay] pcap_sendpacket return %d error=%s\n", res, pcap_geterr(handle));
 		}
-		cout << "left packet size = " << left_payload_size << endl;
+		//cout << "left packet size = " << left_payload_size << endl;
 	}
 }
 
 int main(int argc, char* argv[]) {
 	if (argc != 6) {
-		//if no argument, or not fair of argumentka
 		usage();
 		return -1;
 	}
 	char* dev = argv[1];
 	char errbuf[PCAP_ERRBUF_SIZE];
 
-	handle = pcap_open_live(dev, 65535, 1, 1, errbuf);
+	handle = pcap_open_live(dev, MAX_PACKET_SIZE, 1, 1, errbuf);
 	if (handle == nullptr) {
 		fprintf(stderr, "[main] couldn't open device %s(%s)\n", dev, errbuf);
 		return -1;
@@ -333,15 +327,15 @@ int main(int argc, char* argv[]) {
 					break;
 				}
 			}
-
+			
+			cout << "[main_Relay] " << string(eth_hdr->eth_.smac()) << " -> " << string(eth_hdr->eth_.dmac()) << ", length : " << packet_size << endl;
+			
+			eth_hdr->eth_.smac_ = MY_NETWROK.mac;
 
 			if(packet_size > 1514){
-				cout << "[main_Relay] " << string(eth_hdr->eth_.smac()) << " -> " << string(eth_hdr->eth_.dmac()) << ", length : " << packet_size << " DROP" << endl;
-				//RelayJumboFrame(packet, eth_hdr);
+				RelayJumboFrame(packet, eth_hdr);
 				continue;
 			}
-			cout << "[main_Relay] " << string(eth_hdr->eth_.smac()) << " -> " << string(eth_hdr->eth_.dmac()) << ", length : " << packet_size << endl;
-			eth_hdr->eth_.smac_ = MY_NETWROK.mac;
 
 			//패킷 생성
 			memcpy(relayData, packet, packet_size);
