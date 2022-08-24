@@ -1,4 +1,4 @@
-//20220822 BoB 11th 이예찬
+//20220824 BoB 11th 이예찬
 #include <pcap.h>
 #include "ethhdr.h"
 #include "arphdr.h"
@@ -32,7 +32,7 @@ struct Iphdr {
 	u_char ip_p;		/* protocol */
 	u_short ip_sum;		/* checksum 10-11*/
 	Ip ip_src;
-	Ip ip_dst; /* source and dest address */
+	Ip ip_dst;
 };
 #define IP_HL(ip)		(((ip)->ip_vhl) & 0x0f)
 #define IP_V(ip)		(((ip)->ip_vhl) >> 4)
@@ -70,14 +70,7 @@ struct tcp {
 	u_short th_sum;		/* checksum */
 	u_short th_urp;		/* urgent pointer */
 };
-struct PseudoHeader {
-	Ip ip_src;
-	Ip ip_dst; /* source and dest address */
-	u_char reserved = 0;
-	u_char ip_p = 0x06;		/* protocol */
-	uint16_t tcp_len;
 
-};
 vector<Flow> flows;
 pcap_t* handle = NULL;
 
@@ -248,44 +241,34 @@ void RelayJumboFrame(const u_char* packet, EthArpPacket *eth_hdr){
 	memcpy(relayData, eth_hdr, 54);				//copy ethernet + ip header to ralaydata array
 	memcpy(data, eth_hdr, MAX_PACKET_SIZE);		//copy packet data to static data array
 
-	//get size of payload
 	struct Iphdr *ip_hdr = (struct Iphdr*) (relayData + 14);
 	u_int size_ip = IP_HL(ip_hdr)*4;
 	struct tcp *tcp_hdr = (struct tcp*)(relayData + 14 + size_ip);
 	u_int size_tcp = TH_OFF(tcp_hdr)*4; 
 	u_int payload_size = ntohs(ip_hdr->ip_len) - size_ip - size_tcp;
-	tcp_hdr->th_offx2 = 0x50;
+	tcp_hdr->th_offx2 = 0x50;		//Set TCP Header Length = 20byte
 
 	int packet_offset = 0;
 	int left_payload_size = payload_size;
-	uint16_t fragment_Offset = 0;
 
 	while(left_payload_size > 0){
-		//IP Header, Modify Total Length, Mf, Offset, Checksum
+		//set IP Header total length, checksum, TCP Header Checksum
 		int read_size = ((left_payload_size >= 1460) ? (1460) 	: left_payload_size);
 		tcp_hdr->th_seq = htonl(ntohl(tcp_hdr->th_seq) + packet_offset);
-		tcp_hdr->th_offx2 = 0x50;
 		ip_hdr->ip_len = htons(read_size + 40);
-		// cout << "ip len : " << ntohs(ip_hdr->ip_len) << " MF flag " << MFflags << " Offset " << ntohs(ip_hdr->ip_off) << " read size " << read_size << endl;
-		//cout << "ip src : " << string(Ip(htonl(ip_hdr->ip_src))) << " ip dst : " << string(Ip(htonl(ip_hdr->ip_dst))) << endl;
-		
+
 		memcpy(relayData + 54, data + 54 + packet_offset, read_size);
 
-		//calculate IP header Checksum;
 		ip_hdr->ip_sum = 0;
 		ip_hdr->ip_sum = CalcIPChecksum((relayData + 14), 20);
 
-		//calculate TCP header Checksum
 		compute_tcp_checksum(ip_hdr, (u_short *)(relayData + 14 + size_ip));
-		//printf("Persued Check Sum %04x\n\n", htons(tcp_hdr->th_sum));
 			 
-		//prepare complete. copy payload and send
 		int res = pcap_sendpacket(handle, reinterpret_cast<const u_char*>(relayData),  read_size + 54);
 		if (res != 0) {
 			fprintf(stderr, "[main_Relay] pcap_sendpacket return %d error=%s\n", res, pcap_geterr(handle));
 		}
 
-		fragment_Offset += (read_size / 8);
 		left_payload_size -= read_size;
 		packet_offset += read_size;
 	}
@@ -339,8 +322,6 @@ int main(int argc, char* argv[]) {
 	u_char relayData[1515];
 	int res;
 
-
-
 	while (1) {
 		res = pcap_next_ex(handle, &header, &packet);
 		if (res == 0)
@@ -350,7 +331,7 @@ int main(int argc, char* argv[]) {
 			exit(1);
 		}
 
-		struct EthArpPacket *eth_hdr = (struct EthArpPacket *)packet; //EtherntARP Header Struct
+		struct EthArpPacket *eth_hdr = (struct EthArpPacket *)packet;
 
 		if(eth_hdr->eth_.smac() != flows.at(0).sender_mac && eth_hdr->eth_.smac() != flows.at(1).sender_mac)
 			continue;
@@ -365,16 +346,15 @@ int main(int argc, char* argv[]) {
 			for (int i = 2; i < 4; i++) {
 				if(flows.at(i).sender_mac != eth_hdr->eth_.smac())
 					continue;
-				// if(eth_hdr->eth_.dmac().isBroadcast()){
-				// 	sleep(0.5); //딜레이가 없을 경우 Sender에게 Target보다 먼저 Reply가 도착할 수 있음.
-				// }
+				if(eth_hdr->eth_.dmac().isBroadcast()){
+					sleep(0.2); //딜레이가 없을 경우 Sender에게 Target보다 먼저 Reply가 도착할 수 있음.
+				}
 				SendArpReply(&(flows.at(i)));
 				break;
 			}
 		}
 		else{
-			//패킷 릴레이
-			//ethernet 레이어만 수정
+			//Packet Relay
 			if(eth_hdr->eth_.type() != EthHdr::Ip4)
 				continue;
 
@@ -382,7 +362,7 @@ int main(int argc, char* argv[]) {
 				continue;
 
 			struct Iphdr *ip = (struct Iphdr *) (packet + 14);
-			uint packet_size = ntohs(ip->ip_len) + 14;	// ip해더에서 totallength를 이용해서 전체 패킷 길이 계산.
+			uint packet_size = ntohs(ip->ip_len) + 14;
 
 			for (int i = 0; i < 2; i++) {
 				if(eth_hdr->eth_.smac() == flows.at(i).sender_mac){
@@ -394,12 +374,12 @@ int main(int argc, char* argv[]) {
 			cout << "[main_Relay] " << string(eth_hdr->eth_.smac()) << " -> " << string(eth_hdr->eth_.dmac()) << ", length : " << packet_size  << endl;
 			
 			eth_hdr->eth_.smac_ = MY_NETWROK.mac;
+			
 			if(packet_size > 1514){
 				RelayJumboFrame(packet, eth_hdr);
 				continue;
 			}
 
-			//패킷 생성
 			memcpy(relayData, packet, packet_size);
 			memcpy(relayData, eth_hdr, 14);
 
