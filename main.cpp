@@ -12,7 +12,7 @@
 #include <vector>
 #include <pthread.h>
 #include <signal.h>
-#define MAX_PACKET_SIZE 10000
+#define MAX_PACKET_SIZE 15000
 using namespace std;
 
 #pragma pack(push, 1)
@@ -48,13 +48,12 @@ typedef struct Flow{
 	Ip target_ip;
 	Mac target_mac;
 } Flow; 
-typedef u_int tcp_seq;
 
 struct tcp {
 	u_short th_sport;	/* source port */
 	u_short th_dport;	/* destination port */
-	tcp_seq th_seq;		/* sequence number */
-	tcp_seq th_ack;		/* acknowledgement number */
+	u_int th_seq;		/* sequence number */
+	u_int th_ack;		/* acknowledgement number */
 	u_char th_offx2;	/* data offset, rsvd */
 #define TH_OFF(th)	(((th)->th_offx2 & 0xf0) >> 4)
 	u_char th_flags;
@@ -71,7 +70,14 @@ struct tcp {
 	u_short th_sum;		/* checksum */
 	u_short th_urp;		/* urgent pointer */
 };
+struct PseudoHeader {
+	Ip ip_src;
+	Ip ip_dst; /* source and dest address */
+	u_char reserved = 0;
+	u_char ip_p = 0x06;		/* protocol */
+	uint16_t tcp_len;
 
+};
 vector<Flow> flows;
 pcap_t* handle = NULL;
 
@@ -187,20 +193,68 @@ void sig_handler(int sig){
 	printf("[sig_handler] User Terminates Program\n");
   	exit(0) ;
 }
+uint16_t CalcIPChecksum(u_char * arr, int size){
+	uint32_t check_sum = 0;
+	for(int i = 0; i < size / 2; i++){
+		uint16_t tmp;
+		memcpy(&tmp, arr + (i*2), 2);
+		check_sum += tmp;
+	}
+	uint32_t carry = ((0xFFFF0000 & check_sum) >> 16);
+	return ((check_sum + carry) ^ 0xFFFF);
+}
 
+/* Reference : https://gist.github.com/david-hoze/0c7021434796997a4ca42d7731a7073a */
+/* set tcp checksum: given IP header and tcp segment */
+void compute_tcp_checksum(struct Iphdr *pIph, unsigned short *ipPayload) {
+    unsigned long sum = 0;
+    unsigned short tcpLen = ntohs(pIph->ip_len) - IP_HL(pIph)*4;
+    struct tcp *tcphdrp = (struct tcp*)(ipPayload);
+    //add the pseudo header 
+    //the source ip
+    sum += (pIph->ip_src>>16)&0xFFFF;
+    sum += (pIph->ip_src)&0xFFFF;
+    //the dest ip
+    sum += (pIph->ip_dst>>16)&0xFFFF;
+    sum += (pIph->ip_dst)&0xFFFF;
+    //protocol and reserved: 6
+    sum += htons(IPPROTO_TCP);
+    //the length
+    sum += htons(tcpLen);
+ 
+    //add the IP payload
+    //initialize checksum to 0
+    tcphdrp->th_sum = 0;
+    while (tcpLen > 1) {
+        sum += * ipPayload++;
+        tcpLen -= 2;
+    }
+    //if any bytes left, pad the bytes and add
+    if(tcpLen > 0) {
+        //printf("+++++++++++padding, %dn", tcpLen);
+        sum += ((*ipPayload)&htons(0xFF00));
+    }
+      //Fold 32-bit sum to 16 bits: add carrier to result
+      while (sum>>16) {
+          sum = (sum & 0xffff) + (sum >> 16);
+      }
+      sum = ~sum;
+    //set computation result
+    tcphdrp->th_sum = (unsigned short)sum;
+}
 void RelayJumboFrame(const u_char* packet, EthArpPacket *eth_hdr){
 	u_char data[MAX_PACKET_SIZE];				//copy of packet
 	u_char relayData[1515];						//Actually Send Data
+	memcpy(relayData, eth_hdr, 54);				//copy ethernet + ip header to ralaydata array
+	memcpy(data, eth_hdr, MAX_PACKET_SIZE);		//copy packet data to static data array
 
 	//get size of payload
-	struct Iphdr *ip_hdr = (struct Iphdr*) (packet + 14);
+	struct Iphdr *ip_hdr = (struct Iphdr*) (relayData + 14);
 	u_int size_ip = IP_HL(ip_hdr)*4;
-	struct tcp *tcp_hdr = (struct tcp*)(packet + 14 + size_ip);
+	struct tcp *tcp_hdr = (struct tcp*)(relayData + 14 + size_ip);
 	u_int size_tcp = TH_OFF(tcp_hdr)*4; 
 	u_int payload_size = ntohs(ip_hdr->ip_len) - size_ip - size_tcp;
-
-	memcpy(relayData, eth_hdr, 34);				//copy ethernet + ip header to ralaydata array
-	memcpy(data, eth_hdr, MAX_PACKET_SIZE);		//copy packet data to static data array
+	tcp_hdr->th_offx2 = 0x50;
 
 	int packet_offset = 0;
 	int left_payload_size = payload_size;
@@ -208,31 +262,25 @@ void RelayJumboFrame(const u_char* packet, EthArpPacket *eth_hdr){
 
 	while(left_payload_size > 0){
 		//IP Header, Modify Total Length, Mf, Offset, Checksum
-		int read_size = ((left_payload_size >= 1480) ? (1480) : left_payload_size);
-		u_short ip_len = htons(read_size + 20);
-		uint16_t MFflags = (left_payload_size > 1480 ? 0x2000 : 0);
-		uint16_t flags = htons(MFflags | fragment_Offset);
-		//cout << "ip len : " << ntohs(ip_len) << "MF flag " << MFflags << " Offset " << fragment_Offset << " read size " << read_size << endl;
-		//cout << "ip src : " << string(Ip(htonl(ip_hdr->ip_src))) << "ip dst : " << string(Ip(htonl(ip_hdr->ip_dst))) << endl;
-		memcpy(relayData + 16, &ip_len, 2);
-		memcpy(relayData + 20, &flags, 2);
+		int read_size = ((left_payload_size >= 1460) ? (1460) 	: left_payload_size);
+		tcp_hdr->th_seq = htonl(ntohl(tcp_hdr->th_seq) + packet_offset);
+		tcp_hdr->th_offx2 = 0x50;
+		ip_hdr->ip_len = htons(read_size + 40);
+		// cout << "ip len : " << ntohs(ip_hdr->ip_len) << " MF flag " << MFflags << " Offset " << ntohs(ip_hdr->ip_off) << " read size " << read_size << endl;
+		//cout << "ip src : " << string(Ip(htonl(ip_hdr->ip_src))) << " ip dst : " << string(Ip(htonl(ip_hdr->ip_dst))) << endl;
+		
+		memcpy(relayData + 54, data + 54 + packet_offset, read_size);
 
-		//calculate IP header Checksum
-		memset(relayData+14+10, 0, 2);
-		uint32_t check_sum = 0;
-		for(int i = 0; i < 10; i++){
-			uint16_t tmp;
-			memcpy(&tmp, relayData+14+(i*2), 2);
-			check_sum += tmp;
-		}
-		uint32_t carry = 0xFFFF0000;
-		carry = (carry & check_sum) >> 16;
-		uint16_t result = (check_sum + carry) ^ 0xFFFF; 
-		memcpy(relayData + 14 + 10, &result, 2);
+		//calculate IP header Checksum;
+		ip_hdr->ip_sum = 0;
+		ip_hdr->ip_sum = CalcIPChecksum((relayData + 14), 20);
 
+		//calculate TCP header Checksum
+		compute_tcp_checksum(ip_hdr, (u_short *)(relayData + 14 + size_ip));
+		//printf("Persued Check Sum %04x\n\n", htons(tcp_hdr->th_sum));
+			 
 		//prepare complete. copy payload and send
-		memcpy(relayData + 34, data + 34 + packet_offset, read_size);
-		int res = pcap_sendpacket(handle, reinterpret_cast<const u_char*>(relayData),  read_size + 34);
+		int res = pcap_sendpacket(handle, reinterpret_cast<const u_char*>(relayData),  read_size + 54);
 		if (res != 0) {
 			fprintf(stderr, "[main_Relay] pcap_sendpacket return %d error=%s\n", res, pcap_geterr(handle));
 		}
@@ -290,6 +338,9 @@ int main(int argc, char* argv[]) {
 	const u_char* packet;
 	u_char relayData[1515];
 	int res;
+
+
+
 	while (1) {
 		res = pcap_next_ex(handle, &header, &packet);
 		if (res == 0)
@@ -314,9 +365,9 @@ int main(int argc, char* argv[]) {
 			for (int i = 2; i < 4; i++) {
 				if(flows.at(i).sender_mac != eth_hdr->eth_.smac())
 					continue;
-				if(eth_hdr->eth_.dmac().isBroadcast()){
-					sleep(0.5); //딜레이가 없을 경우 Sender에게 Target보다 먼저 Reply가 도착할 수 있음.
-				}
+				// if(eth_hdr->eth_.dmac().isBroadcast()){
+				// 	sleep(0.5); //딜레이가 없을 경우 Sender에게 Target보다 먼저 Reply가 도착할 수 있음.
+				// }
 				SendArpReply(&(flows.at(i)));
 				break;
 			}
@@ -329,7 +380,7 @@ int main(int argc, char* argv[]) {
 
 			if(eth_hdr->eth_.dmac() != MY_NETWROK.mac)
 				continue;
-				
+
 			struct Iphdr *ip = (struct Iphdr *) (packet + 14);
 			uint packet_size = ntohs(ip->ip_len) + 14;	// ip해더에서 totallength를 이용해서 전체 패킷 길이 계산.
 
