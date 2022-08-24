@@ -238,8 +238,9 @@ void compute_tcp_checksum(struct Iphdr *pIph, unsigned short *ipPayload) {
 void RelayJumboFrame(const u_char* packet, EthArpPacket *eth_hdr){
 	u_char data[MAX_PACKET_SIZE];				//copy of packet
 	u_char relayData[1515];						//Actually Send Data
-	memcpy(relayData, eth_hdr, 54);				//copy ethernet + ip header to ralaydata array
-	memcpy(data, eth_hdr, MAX_PACKET_SIZE);		//copy packet data to static data array
+	memcpy(data, packet, MAX_PACKET_SIZE);		//copy packet data to static data array
+	memcpy(relayData, packet, 54);				//copy packet data to static data array
+	memcpy(relayData, eth_hdr, 14);				//copy ethernet + ip header to ralaydata array
 
 	struct Iphdr *ip_hdr = (struct Iphdr*) (relayData + 14);
 	u_int size_ip = IP_HL(ip_hdr)*4;
@@ -247,20 +248,19 @@ void RelayJumboFrame(const u_char* packet, EthArpPacket *eth_hdr){
 	u_int size_tcp = TH_OFF(tcp_hdr)*4; 
 	u_int payload_size = ntohs(ip_hdr->ip_len) - size_ip - size_tcp;
 	tcp_hdr->th_offx2 = 0x50;		//Set TCP Header Length = 20byte
-
-	int packet_offset = 0;
-	int left_payload_size = payload_size;
+	uid_t tcp_sequence_base = ntohl(tcp_hdr->th_seq);
+	u_int packet_offset = 0;
+	u_int left_payload_size = payload_size;
 
 	while(left_payload_size > 0){
 		//set IP Header total length, checksum, TCP Header Checksum
-		int read_size = ((left_payload_size >= 1460) ? (1460) 	: left_payload_size);
-		tcp_hdr->th_seq = htonl(ntohl(tcp_hdr->th_seq) + packet_offset);
+		int read_size = ((left_payload_size >= 1460) ? (1460) : left_payload_size);
+		tcp_hdr->th_seq = htonl(tcp_sequence_base + packet_offset);
 		ip_hdr->ip_len = htons(read_size + 40);
-
 		memcpy(relayData + 54, data + 54 + packet_offset, read_size);
 
 		ip_hdr->ip_sum = 0;
-		ip_hdr->ip_sum = CalcIPChecksum((relayData + 14), 20);
+		ip_hdr->ip_sum = CalcIPChecksum(relayData + 14, 20);
 
 		compute_tcp_checksum(ip_hdr, (u_short *)(relayData + 14 + size_ip));
 			 
